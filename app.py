@@ -6,9 +6,15 @@ import numpy as np
 from transformers import BertModel, AutoTokenizer
 import re
 from flask_cors import CORS
+from joblib import load as joblib_load
+import logging
 
 app = Flask(__name__)
 CORS(app)  
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configurações
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -39,15 +45,15 @@ def load_best_model(model, best_model_path):
         # Verificar se é um checkpoint completo ou apenas state_dict
         if 'state_dict' in checkpoint:
             model.load_state_dict(checkpoint['state_dict'])
-            print(f"Modelo carregado com sucesso! Época: {checkpoint.get('epoch', 'N/A')}")
+            logger.info(f"Modelo carregado com sucesso! Época: {checkpoint.get('epoch', 'N/A')}")
         else:
             # Se for apenas o state_dict
             model.load_state_dict(checkpoint)
-            print("State dict carregado com sucesso!")
+            logger.info("State dict carregado com sucesso!")
             
         return model
     except Exception as e:
-        print(f"Erro ao carregar modelo: {e}")
+        logger.error(f"Erro ao carregar modelo: {e}")
         return None
 
 # Inicializar tokenizer
@@ -55,28 +61,70 @@ tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 
 # Labels das emoções (ajuste conforme seu dataset)
 EMOTION_LABELS = [
-    'Alegria',      # 0
-    'Tristeza',     # 1
-    'Raiva',        # 2
-    'Medo',         # 3
-    'Surpresa',     # 4
-    'Nojo',         # 5
-    'Confiança',    # 6
-    'Antecipação',  # 7
+    'Alegria',     # 0
+    'Tristeza',    # 1
+    'Raiva',       # 2
+    'Medo',        # 3
+    'Surpresa',    # 4
+    'Nojo',        # 5
+    'Confiança',   # 6
+    'Antecipação', # 7
 ]
 
-# Carregar modelo global
-print("Carregando modelo...")
-best_model_path = 'weights.pt'  # ou "modelo_emocoes.pt"
+# Labels para SVM (deve corresponder ao treinamento do modelo SVM)
+SVM_LABELS = ['alegria', 'tristeza', 'raiva', 'medo', 'nojo', 'surpresa', 'confianca', 'antecipacao']
+
+# Carregar modelo BERT global
+logger.info("Carregando modelo BERT...")
+best_model_path = 'models/weights.pt'  # ou "modelo_emocoes.pt"
 model = BERTClass()
 model = load_best_model(model, best_model_path)
 
 if model is not None:
     model.to(device)
     model.eval()
-    print(f"Modelo carregado e movido para: {device}")
+    logger.info(f"Modelo BERT carregado e movido para: {device}")
 else:
-    print("ERRO: Não foi possível carregar o modelo!")
+    logger.error("ERRO: Não foi possível carregar o modelo BERT!")
+
+# Carregar modelo SVM e vetorizador
+svm_compatible = False
+try:
+    modelo_svm = joblib_load('models/svm.pkl')
+    vetorizador = joblib_load('vec/vetorizador.pkl')
+    
+    # Testar compatibilidade na inicialização
+    try:
+        test_text = ["texto de teste"]
+        test_vector = vetorizador.transform(test_text)
+        n_features_vetorizador = test_vector.shape[1]
+        
+        # Verificar quantas features o modelo SVM espera
+        if hasattr(modelo_svm, 'coef_'):
+            n_features_modelo = modelo_svm.coef_.shape[1]
+        elif hasattr(modelo_svm, 'n_features_in_'):
+            n_features_modelo = modelo_svm.n_features_in_
+        else:
+            n_features_modelo = None
+            
+        if n_features_modelo is not None:
+            if n_features_vetorizador == n_features_modelo:
+                svm_compatible = True
+                logger.info(f"SVM e vetorizador compatíveis: {n_features_modelo} features")
+            else:
+                logger.error(f"INCOMPATIBILIDADE: Vetorizador produz {n_features_vetorizador} features, mas SVM espera {n_features_modelo}")
+        else:
+            logger.warning("Não foi possível determinar o número de features esperado pelo modelo SVM")
+            
+    except Exception as e:
+        logger.error(f"Erro ao testar compatibilidade SVM: {e}")
+        
+    logger.info("Modelo SVM e vetorizador carregados com sucesso!")
+    
+except Exception as e:
+    modelo_svm = None
+    vetorizador = None
+    logger.error(f"Erro ao carregar modelo SVM ou vetorizador: {e}")
 
 # Função de pré-processamento
 def preprocess_text(text):
@@ -120,18 +168,116 @@ def home():
     """Endpoint de teste"""
     return jsonify({
         "status": "API de Classificação de Emoções",
-        "modelo_carregado": model is not None,
+        "modelo_bert_carregado": model is not None,
+        "modelo_svm_carregado": modelo_svm is not None and vetorizador is not None,
+        "svm_compativel": svm_compatible,
         "device": str(device),
         "emocoes_disponiveis": EMOTION_LABELS
     })
 
-@app.route('/predict', methods=['POST'])
+@app.route('/svm', methods=['POST'])
+def prever_emocao_svm():
+    """Endpoint para predição de emoções usando SVM"""
+    try:
+        # Verificar se o modelo SVM e vetorizador foram carregados
+        if modelo_svm is None or vetorizador is None:
+            return jsonify({
+                "erro": "Modelo SVM ou vetorizador não carregado",
+                "solucao": "Verifique se os arquivos 'models/svm.pkl' e 'vec/vetorizador.pkl' existem"
+            }), 500
+
+        # Verificar compatibilidade
+        if not svm_compatible:
+            return jsonify({
+                "erro": "Modelo SVM e vetorizador incompatíveis",
+                "detalhes": "O vetorizador e o modelo SVM foram treinados separadamente e têm dimensões diferentes",
+                "solucao": "Você precisa treinar e salvar o vetorizador e o modelo SVM juntos no mesmo experimento. Não é possível corrigir isso apenas alterando o código - é necessário retreinar os modelos."
+            }), 500
+
+        data = request.get_json()
+        frase = data.get('frase') if data else None
+
+        if not frase or len(frase.strip()) == 0:
+            return jsonify({"erro": "Por favor, forneça uma frase."}), 400
+
+        # Pré-processar a frase
+        frase_processada = preprocess_text(frase)
+        logger.info(f"Texto processado: '{frase_processada}'")
+        
+        # Transformar a frase usando o vetorizador treinado
+        frase_vetorizada = vetorizador.transform([frase_processada])
+        logger.info(f"Shape do vetor: {frase_vetorizada.shape}")
+
+        # Fazer predição
+        # Verificar se o modelo tem predict_proba (para probabilidades) ou apenas predict
+        if hasattr(modelo_svm, 'predict_proba'):
+            # Se tiver predict_proba, usar para obter probabilidades
+            probabilidades = modelo_svm.predict_proba(frase_vetorizada)[0]
+            indice_emocao = np.argmax(probabilidades)
+            confianca = probabilidades[indice_emocao]
+            
+            # Criar dicionário com todas as probabilidades
+            todas_probabilidades = {
+                SVM_LABELS[i]: float(probabilidades[i]) 
+                for i in range(min(len(SVM_LABELS), len(probabilidades)))
+            }
+            
+        else:
+            # Se não tiver, usar predict normal
+            predicao = modelo_svm.predict(frase_vetorizada)[0]
+            logger.info(f"Predição SVM: {predicao}")
+            
+            # Se a predição for um índice numérico
+            if isinstance(predicao, (int, np.integer)):
+                indice_emocao = predicao
+                confianca = 1.0  # Não temos informação de confiança
+            else:
+                # Se a predição for uma string/label, encontrar o índice
+                try:
+                    indice_emocao = SVM_LABELS.index(predicao)
+                    confianca = 1.0
+                except ValueError:
+                    return jsonify({"erro": f"Label '{predicao}' não encontrado nos labels conhecidos: {SVM_LABELS}"}), 500
+            
+            todas_probabilidades = None
+
+        # Garantir que o índice está dentro do range válido
+        if indice_emocao >= len(SVM_LABELS):
+            return jsonify({"erro": f"Índice de emoção inválido: {indice_emocao}. Labels disponíveis: {SVM_LABELS}"}), 500
+
+        emocao_principal = SVM_LABELS[indice_emocao]
+
+        resultado = {
+            "emocao": emocao_principal,
+            "confianca": float(confianca) if hasattr(modelo_svm, 'predict_proba') else None,
+            "texto_original": frase,
+            "texto_processado": frase_processada
+        }
+
+        # Se temos probabilidades, incluir todas
+        if todas_probabilidades:
+            resultado["todas_emocoes"] = todas_probabilidades
+            # Ranking das top 3 emoções
+            ranking = sorted(todas_probabilidades.items(), key=lambda x: x[1], reverse=True)
+            resultado["ranking_emocoes"] = ranking[:3]
+
+        return jsonify(resultado)
+
+    except Exception as e:
+        logger.error(f"Erro na predição SVM: {str(e)}")
+        return jsonify({
+            "erro": "Erro interno do servidor",
+            "detalhes": str(e),
+            "tipo_erro": type(e).__name__
+        }), 500
+
+@app.route('/bert', methods=['POST'])
 def predict_emotion():
-    """Endpoint principal para predição de emoções"""
+    """Endpoint principal para predição de emoções usando BERT"""
     try:
         # Verificar se o modelo foi carregado
         if model is None:
-            return jsonify({"erro": "Modelo não carregado"}), 500
+            return jsonify({"erro": "Modelo BERT não carregado"}), 500
         
         # Obter dados da requisição
         data = request.get_json()
@@ -186,16 +332,52 @@ def predict_emotion():
         })
         
     except Exception as e:
+        logger.error(f"Erro na predição BERT: {str(e)}")
         return jsonify({"erro": f"Erro na predição: {str(e)}"}), 500
 
+# Endpoint de diagnóstico
+@app.route('/debug/svm', methods=['GET'])
+def debug_svm():
+    """Endpoint para diagnosticar problemas do SVM"""
+    debug_info = {
+        "svm_carregado": modelo_svm is not None,
+        "vetorizador_carregado": vetorizador is not None,
+        "compatibilidade": svm_compatible
+    }
+    
+    if modelo_svm is not None:
+        debug_info["tipo_modelo"] = type(modelo_svm).__name__
+        debug_info["tem_predict_proba"] = hasattr(modelo_svm, 'predict_proba')
+        
+        if hasattr(modelo_svm, 'coef_'):
+            debug_info["features_esperadas"] = modelo_svm.coef_.shape[1]
+        elif hasattr(modelo_svm, 'n_features_in_'):
+            debug_info["features_esperadas"] = modelo_svm.n_features_in_
+    
+    if vetorizador is not None:
+        debug_info["tipo_vetorizador"] = type(vetorizador).__name__
+        try:
+            test_vector = vetorizador.transform(["teste"])
+            debug_info["features_produzidas"] = test_vector.shape[1]
+        except Exception as e:
+            debug_info["erro_vetorizador"] = str(e)
+    
+    return jsonify(debug_info)
 
 if __name__ == '__main__':
     print("\n" + "="*50)
     print("INICIANDO API DE CLASSIFICAÇÃO DE EMOÇÕES")
     print("="*50)
     print(f"Device: {device}")
-    print(f"Modelo carregado: {'✅' if model is not None else '❌'}")
-    print(f"Emoções: {len(EMOTION_LABELS)}")
+    print(f"Modelo BERT carregado: {'✅' if model is not None else '❌'}")
+    print(f"Modelo SVM carregado: {'✅' if modelo_svm is not None else '❌'}")
+    print(f"SVM compatível: {'✅' if svm_compatible else '❌'}")
+    print(f"Emoções BERT: {len(EMOTION_LABELS)}")
+    print(f"Emoções SVM: {len(SVM_LABELS)}")
     print("="*50)
+    
+    if not svm_compatible and modelo_svm is not None:
+        print("⚠️  ATENÇÃO: Modelo SVM e vetorizador são incompatíveis!")
+        print("   Para corrigir: retreine e salve os modelos juntos.")
     
     app.run(host='0.0.0.0', port=3030, debug=True)
