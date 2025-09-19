@@ -71,12 +71,12 @@ EMOTION_LABELS = [
     'Antecipação', # 7
 ]
 
-# Labels para SVM (deve corresponder ao treinamento do modelo SVM)
+# Labels para SVM 
 SVM_LABELS = ['alegria', 'tristeza', 'raiva', 'medo', 'nojo', 'surpresa', 'confianca', 'antecipacao']
 
 # Carregar modelo BERT global
 logger.info("Carregando modelo BERT...")
-best_model_path = 'models/weights.pt'  # ou "modelo_emocoes.pt"
+best_model_path = 'models/weights.pt'  
 model = BERTClass()
 model = load_best_model(model, best_model_path)
 
@@ -334,35 +334,6 @@ def predict_emotion():
     except Exception as e:
         logger.error(f"Erro na predição BERT: {str(e)}")
         return jsonify({"erro": f"Erro na predição: {str(e)}"}), 500
-
-# Endpoint de diagnóstico
-@app.route('/debug/svm', methods=['GET'])
-def debug_svm():
-    """Endpoint para diagnosticar problemas do SVM"""
-    debug_info = {
-        "svm_carregado": modelo_svm is not None,
-        "vetorizador_carregado": vetorizador is not None,
-        "compatibilidade": svm_compatible
-    }
-    
-    if modelo_svm is not None:
-        debug_info["tipo_modelo"] = type(modelo_svm).__name__
-        debug_info["tem_predict_proba"] = hasattr(modelo_svm, 'predict_proba')
-        
-        if hasattr(modelo_svm, 'coef_'):
-            debug_info["features_esperadas"] = modelo_svm.coef_.shape[1]
-        elif hasattr(modelo_svm, 'n_features_in_'):
-            debug_info["features_esperadas"] = modelo_svm.n_features_in_
-    
-    if vetorizador is not None:
-        debug_info["tipo_vetorizador"] = type(vetorizador).__name__
-        try:
-            test_vector = vetorizador.transform(["teste"])
-            debug_info["features_produzidas"] = test_vector.shape[1]
-        except Exception as e:
-            debug_info["erro_vetorizador"] = str(e)
-    
-    return jsonify(debug_info)
 
 if __name__ == '__main__':
     print("\n" + "="*50)
